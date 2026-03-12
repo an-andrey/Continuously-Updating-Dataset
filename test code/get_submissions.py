@@ -1,4 +1,4 @@
-# python 1_get_submissions.py subredditname timeframe_in_days
+# python get_submissions.py subredditname timeframe_in_days
 # Example: python 1_get_submissions.py pics 7
 
 import praw, json, time, os, sys, re, requests, shutil

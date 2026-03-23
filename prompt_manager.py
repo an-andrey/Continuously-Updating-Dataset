@@ -19,10 +19,10 @@ class ReLaionPromptStreamer:
             self.iterator = iter(self.shuffled_stream)
             return self.get_next_prompt()
 
-# prompt_engine = ReLaionPromptStreamer()
+prompt_engine = ReLaionPromptStreamer()
 
-# for i in range(15):
-#     print(prompt_engine.get_next_prompt())
+for i in range(15):
+    print(prompt_engine.get_next_prompt())
 
 import random
 

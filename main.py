@@ -1,8 +1,8 @@
 import os
 import shutil
 from reddit_scraper import run_reddit_scraper
-from hf_pipeline import run_hf_generator
-from hf_uploader import package_and_upload
+from huggingface_pipeline import run_hf_generator
+from huggingface_uploader import package_and_upload
 
 STAGING_DIR = "data/staging_images"
 REPO_ID = "an-andrey/Continous-Deepfakes"

@@ -57,7 +57,7 @@ def run_hf_generator(staging_dir="data/staging"): # main loop, called in main.py
         sort="downloads",
         direction=-1,
         expand=["downloadsAllTime","downloads"],
-        limit=10
+        limit=200
     )
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -76,40 +76,40 @@ def run_hf_generator(staging_dir="data/staging"): # main loop, called in main.py
             
         model_type, target_count = classify_model(model)
         print(f"Processing {model.id} | Type: {model_type} | Target: {target_count} images")
+        model_list.append([model.id, model_type, target_count, downloads])
         
-        try:
-            pipeline = AutoPipelineForText2Image.from_pretrained(
-                model.id, 
-                torch_dtype=torch_dtype,
-                use_safetensors=True,
-                requires_safety_checker=False 
-            ).to(device)
+        # try:
+        #     pipeline = AutoPipelineForText2Image.from_pretrained(
+        #         model.id, 
+        #         torch_dtype=torch_dtype,
+        #         use_safetensors=True,
+        #         requires_safety_checker=False 
+        #     ).to(device)
             
-            # Generate the target amount of images
-            # for i in range(target_count):
-            #     prompt = prompt_generator.get_next_prompt()
-            #     result = pipeline(prompt)
+        #     # Generate the target amount of images
+        #     for i in range(target_count):
+        #         prompt = prompt_generator.get_next_prompt()
+        #         result = pipeline(prompt)
                 
-            #     safe_model_name = model.id.replace("/", "_")
-            #     filename = f"hf_{safe_model_name}_{i}.png"
-            #     filepath = os.path.join(staging_dir, filename)
+        #         safe_model_name = model.id.replace("/", "_")
+        #         filename = f"hf_{safe_model_name}_{i}.png"
+        #         filepath = os.path.join(staging_dir, filename)
                 
-            #     result.images[0].save(filepath)
+        #         result.images[0].save(filepath)
                 
-            #     if i % 100 == 0 and i > 0:
-            #         print(f"generated {i}/{target_count}")
+        #         if i % 100 == 0 and i > 0:
+        #             print(f"generated {i}/{target_count}")
                     
-            # Free memory
-            del pipeline
-            if device == "cuda":
-                torch.cuda.empty_cache()
+        #     # Free memory
+        #     del pipeline
+        #     if device == "cuda":
+        #         torch.cuda.empty_cache()
                 
-            # Mark as seen only if successful
-            seen_models.append(model.id)
-            model_list.append([model.id, model_type, target_count, downloads])
+        #     # Mark as seen only if successful
+        #     seen_models.append(model.id)
             
-        except Exception as e:
-            print(f"Failed to process {model.id}: {e}")
+        # except Exception as e:
+        #     print(f"Failed to process {model.id}: {e}")
     
     return pd.DataFrame(model_list, columns=("Model", "Type", "Target", "Downloads"))
 

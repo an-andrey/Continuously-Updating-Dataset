@@ -37,7 +37,7 @@ if __name__ == "__main__":
     print("\n--- Sharding and Uploading ---")
     try:
         package_and_upload(STAGING_DIR, REPO_ID)
-        cleanup_staging() # removes uploaded pictures from disk
+        # cleanup_staging() # removes uploaded pictures from disk
         print("\nPipeline run completed successfully!")
     except Exception as e:
         print(f"\nPipeline failed during upload: {e}")

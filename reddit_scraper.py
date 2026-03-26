@@ -3,8 +3,11 @@ from datetime import datetime, timezone, timedelta
 from PIL import Image
 from transformers import pipeline
 import pandas as pd
+from dotenv import load_dotenv
 
-TARGET_SUBREDDITS = ["aigeneratedart", "aiArt", "midjourney", "StableDiffusion", "aiimages", "AiArtwork", "AiGeneratedArt", "AiArt", "Pro_Ai_Art"]
+load_dotenv()
+
+TARGET_SUBREDDITS = ["aigeneratedart", "aiArt", "midjourney", "StableDiffusion", "aiimages", "AiArtwork", "AiGeneratedArt", "AiArt", "Pro_Ai_Art", ]
 
 print("Loading NSFW detection model")
 nsfw_classifier = pipeline("image-classification", model="Falconsai/nsfw_image_detection") # NSFW model from HuggingFace
@@ -65,7 +68,7 @@ def run_reddit_scraper(staging_dir, days_ago=1):
 testing = True
 
 if testing:
-    dir = "data/test_reddit"
+    dir = "/home/aandrey/links/scratch/data/reddit_images"
 
     if not os.path.exists(dir):
         os.makedirs(dir)

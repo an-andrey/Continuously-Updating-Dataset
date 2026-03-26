@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=generate_model
 #SBATCH --account=def-rrabba            
-#SBATCH --time=01:00:00                 
-#SBATCH --gpus-per-node=h100:1          
-#SBATCH --cpus-per-task=8                     
+#SBATCH --time=02:00:00                 
+#SBATCH --gpus-per-node=h100:1         
+#SBATCH --cpus-per-task=8           
 #SBATCH --mem=64G                             
 #SBATCH --output=%x-%j.out                    
 

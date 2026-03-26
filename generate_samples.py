@@ -3,12 +3,16 @@ import sys
 import torch
 from diffusers import AutoPipelineForText2Image
 from prompt_manager import CSVPromptStreamer
+from dotenv import load_dotenv
+
+load_dotenv()
+
 model_id = sys.argv[1]
 target_count = int(sys.argv[2])
 model_type = sys.argv[3]
 base_model_id = sys.argv[4]
 
-staging_dir = "data/staging_images"
+staging_dir = "/home/aandrey/links/scratch/data/staging_images"
 os.makedirs(staging_dir, exist_ok=True)
 
 prompt_generator = CSVPromptStreamer()
@@ -40,7 +44,7 @@ try:
         ).to(device)
     
     # Calculate loop iterations safely
-    iterations = int(target_count / 1000)
+    iterations = target_count
     if iterations == 0: iterations = 1 # Ensure at least 1 loop runs if testing with small numbers
     
     for i in range(iterations):
@@ -49,7 +53,7 @@ try:
         
         safe_model_name = model_id.replace("/", "_")
         filename = f"hf_{safe_model_name}_{i}.png"
-        result.images.save(os.path.join(staging_dir, filename))
+        result.images[0].save(os.path.join(staging_dir, filename))
         
         if i % 100 == 0 and i > 0:
             print(f"Generated {i} images...", flush=True)

@@ -23,7 +23,7 @@ import pandas as pd
 import random
 
 class CSVPromptStreamer:
-    def __init__(self, filepath="unused_prompts.csv"):
+    def __init__(self, filepath="unused_prompts2.csv"):
         print(f"Loading and shuffling prompts from {filepath}...")
         
         # Load the CSV

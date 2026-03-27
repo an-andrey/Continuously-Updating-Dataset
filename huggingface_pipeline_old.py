@@ -4,7 +4,10 @@ import torch
 import pandas as pd
 import subprocess
 import shutil
+import time
 from dotenv import load_dotenv
+import builtins
+from datetime import datetime
 
 load_dotenv() 
 
@@ -12,6 +15,14 @@ from huggingface_hub import HfApi, model_info, snapshot_download
 
 TRACKER_FILE = "seen_models.json"
 FAILED_FILE = "failed_models.json"
+
+def timestamped_print(*args, **kwargs):
+    """Wraps the standard print function to prepend a timestamp."""
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    builtins.print(timestamp, *args, **kwargs)
+
+# Replace the built-in print with custom function
+print = timestamped_print
 
 def load_json_registry(filepath):
     if os.path.exists(filepath):
@@ -49,24 +60,25 @@ def classify_model(model):
     
     # Handle edge cases where authors improperly format the YAML as a list
     if isinstance(base_model, list) and len(base_model) > 0:
-        base_model = base_model
+        base_model = base_model[1] # Grab the first element ['base_mode', 'model_id']
         
     # Fallback: Scrape tags if the dependency is injected directly by the Hub
     if not base_model:
         for tag in tags:
             if tag.startswith("base_model:"):
-                base_model = tag.split(":", 1)
+                # Grab ONLY the second half of the split (the actual ID)
+                base_model = tag.split(":", 1) 
                 break
 
     safe_base = base_model if base_model else "None"
     
     # Classification based strictly on Hub metadata architecture
     if "lora" in tags or "peft" in tags or "adapter" in tags:
-        return "LoRA", 2000, safe_base[1] # safe_base stores as array ['base_model', 'model_id']
+        return "LoRA", 2000, safe_base[1]
         
-    # If the model explicitly declares a parent, it is a derivative
+    # If the model explicitly declares a parent, it is a fine-tune
     if base_model:
-        return "Fine-tune", 5000, safe_base
+        return "Fine-tune", 5000, safe_base[1]
         
     # If it has no parent dependency, it is a root node (Base model)
     return "Base", 10000, "None"
@@ -128,16 +140,18 @@ def run_hf_generator():
             print(f"Submitting GPU job array ({array_tasks} parallel tasks) and waiting...")
             
             # The --wait flag will pause the coordinator until ALL array tasks complete
+            safe_model_name = model.id.replace("/", "_")
             process = subprocess.run([
                 "sbatch", 
                 "--wait", 
                 f"--array=0-{array_tasks-1}", 
-                "submit_generate_batch_samples.sh", 
+                f"--output=slurm_logs/gen_hf-{safe_model_name}-%A_%a.out",
+                "submit_generate_batch_samples.sh",
                 model.id, 
                 str(target_count), 
                 model_type, 
                 base_model_id
-            ])
+            ], capture_output=True, text=True)
 
             if process.returncode == 0:
                 print(f"GPU job successful. Logging {model.id}.")
@@ -145,19 +159,19 @@ def run_hf_generator():
                 save_json_registry(TRACKER_FILE, seen_models)
             else:
                 print(f"ERROR: GPU job for {model.id} failed. It will not be marked as seen.")
+                print(f"Slurm Error Details: {process.stderr}")
                 failed_models.append(model.id)
                 save_json_registry(FAILED_FILE, failed_models)
             
-            print(f"GPU job finished. Cleaning up {model.id} to save space...")
+            print(f"GPU job finished. Letting Lustre file system sync before cleanup...")
+            time.sleep(10) # Prevent Errno 116 Stale File Handle
             safe_dir_name = "models--" + model.id.replace("/", "--")
             model_path = os.path.join(os.environ.get("HF_HOME"), "hub", safe_dir_name)
 
             if os.path.exists(model_path):
                 print(f"model found at {model_path} and will be removed")
                 shutil.rmtree(model_path)
-                
-            seen_models.append(model.id)
-            save_json_registry(TRACKER_FILE, seen_models)
+
         
         except KeyboardInterrupt: 
             print("Keyboard interruption, deleting the model")

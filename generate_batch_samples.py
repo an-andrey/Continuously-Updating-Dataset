@@ -60,11 +60,14 @@ try:
             local_files_only=True
         ).to(device)
     
-    # Compile Model for H100
-    print(f"Task {task_id}: Compiling model for H100 optimization (takes ~3-5 mins)...")
+    # Offloads sub-components to standard RAM when not actively being used
+    pipeline.enable_model_cpu_offload() 
+
+    # Decodes the batch of images one-by-one at the very end instead of all at once
+    pipeline.enable_vae_slicing()
     
     # Batched Generation Loop
-    batch_size = 4
+    batch_size = 3
     
     for i in range(0, target_count_for_this_gpu, batch_size):
         # Prevent the final batch from generating too many images

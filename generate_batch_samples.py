@@ -73,9 +73,10 @@ try:
 
     # Decodes the batch of images one-by-one at the very end instead of all at once
     pipeline.enable_vae_slicing()
+    pipeline.enable_vae_tiling()
     
     # Batched Generation Loop
-    batch_size = 3
+    batch_size = 6
     today_date = datetime.now().strftime("%Y-%m-%d")
     
     for i in range(0, target_count_for_this_gpu, batch_size):

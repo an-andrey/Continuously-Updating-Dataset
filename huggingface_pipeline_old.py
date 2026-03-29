@@ -145,7 +145,7 @@ def run_hf_generator():
                 "sbatch", 
                 "--wait", 
                 f"--array=0-{array_tasks-1}", 
-                f"--output=slurm_logs/{TODAY}/gen_hf-{safe_model_name}-%A_%a.out",
+                f"--output=data/slurm_logs/{TODAY}/gen_hf-{safe_model_name}-%A_%a.out",
                 "submit_generate_batch_samples.sh", 
                 model.id, 
                 str(target_count), 

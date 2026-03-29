@@ -8,13 +8,16 @@ import time
 from dotenv import load_dotenv
 import builtins
 from datetime import datetime
+import sys
+import glob
 
 load_dotenv() 
 
 from huggingface_hub import HfApi, model_info, snapshot_download
 
-TRACKER_FILE = "seen_models.json"
-FAILED_FILE = "failed_models.json"
+REGISTRY_FILE = "model_registry.json"
+STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
+TODAY = datetime.now().strftime("%Y-%m-%d")
 
 def timestamped_print(*args, **kwargs):
     """Wraps the standard print function to prepend a timestamp."""
@@ -24,15 +27,15 @@ def timestamped_print(*args, **kwargs):
 # Replace the built-in print with custom function
 print = timestamped_print
 
-def load_json_registry(filepath):
-    if os.path.exists(filepath):
-        with open(filepath, 'r') as f:
+def load_registry():
+    if os.path.exists(REGISTRY_FILE):
+        with open(REGISTRY_FILE, 'r') as f:
             return json.load(f)
-    return []
+    return {}
 
-def save_json_registry(filepath, data_list):
-    with open(filepath, 'w') as f:
-        json.dump(data_list, f)
+def save_registry(registry):
+    with open(REGISTRY_FILE, 'w') as f:
+        json.dump(registry, f, indent=4)
 
 def check_safetensors_available(model_id): #verify safetensors available
     print("verifying tensors...")
@@ -85,105 +88,116 @@ def classify_model(model):
 
 def run_hf_generator():
     api = HfApi()
-    seen_models = load_json_registry(TRACKER_FILE)
-    failed_models = load_json_registry(FAILED_FILE)
+    
+    # Load and sync registry
+    registry = load_registry()
     
     print("Fetching txt2img models from Hugging Face...")
-    models = api.list_models(
-        filter="diffusers", 
-        sort="downloads", 
-        full=True, 
-        limit=1000
-        )
+    models = api.list_models(filter="diffusers", sort="downloads", full=True, limit=1000)
 
     for model in models:
+        # Skip if already processed successfully or blacklisted
+        if model.id in registry:
+            status = registry[model.id].get("status")
+            if status in ["COMPLETED", "MODEL_FAULT"]:
+                continue
+            # If INFRASTRUCTURE_FAULT, we let it try again
+
         downloads = getattr(model, "downloads", 0)
-        if downloads < 30000 or model.id in seen_models or model.id in failed_models or not check_safetensors_available(model.id):
+        if downloads < 30000:
+            continue
+            
+        if not check_safetensors_available(model.id):
+            registry[model.id] = {"status": "MODEL_FAULT", "reason": "No safetensors found", "date": TODAY}
+            save_registry(registry)
             continue
 
         pipeline_task = getattr(model, "pipeline_tag", "") or ""
-        
-        # If the word "video", "audio", or "3d" is anywhere in the task, skip it
         if any(bad_word in pipeline_task.lower() for bad_word in ["video", "audio", "3d"]):
             print(f"Skipping {model.id} because it is a '{pipeline_task}' model.")
-            failed_models.append(model.id)
-            save_json_registry(FAILED_FILE, failed_models)
+            registry[model.id] = {"status": "MODEL_FAULT", "reason": f"Incompatible task: {pipeline_task}", "date": TODAY}
+            save_registry(registry)
             continue
             
         model_type, target_count, base_model_id = classify_model(model)
+        safe_model_name = model.id.replace("/", "_")
 
-        print(f"\n--- Processing {model.id}, that's a {model_type} model ---")
-
-        print(model_type, target_count, base_model_id)
+        print(f"\n--- Processing {model.id} ({model_type}) ---")
         
         try:
             print(f"Downloading {model.id}")
             snapshot_download(repo_id=model.id)
             
             if model_type == "LoRA" and base_model_id != "None":
-                print(f"Downloading required Base Model ({base_model_id})...")
                 snapshot_download(repo_id=base_model_id)
-            
             elif model_type == "LoRA" and base_model_id == "None": 
-                print("lora model had no base model associated, skipping it")
-                failed_models.append(model.id)
-                save_json_registry(FAILED_FILE, failed_models)
+                registry[model.id] = {"status": "MODEL_FAULT", "reason": "Missing base model dependency", "date": TODAY}
+                save_registry(registry)
                 continue
             
-            if target_count >= 10000:
-                array_tasks = 5  # Splits 10k into 5 nodes x 2000
-            elif target_count >= 5000:
-                array_tasks = 2  # Splits 5k into 2 nodes x 2500
-            else:
-                array_tasks = 1  # Runs 2k on 1 node
+            if target_count >= 10000: array_tasks = 5  
+            elif target_count >= 5000: array_tasks = 2  
+            else: array_tasks = 1  
                 
-            print(f"Submitting GPU job array ({array_tasks} parallel tasks) and waiting...")
+            print(f"Submitting Array ({array_tasks} tasks) to slurm_logs/{TODAY}/...")
             
-            # The --wait flag will pause the coordinator until ALL array tasks complete
-            safe_model_name = model.id.replace("/", "_")
             process = subprocess.run([
                 "sbatch", 
                 "--wait", 
                 f"--array=0-{array_tasks-1}", 
-                f"--output=slurm_logs/gen_hf-{safe_model_name}-%A_%a.out",
-                "submit_generate_batch_samples.sh",
+                f"--output=slurm_logs/{TODAY}/gen_hf-{safe_model_name}-%A_%a.out",
+                "submit_generate_batch_samples.sh", 
                 model.id, 
                 str(target_count), 
                 model_type, 
                 base_model_id
             ], capture_output=True, text=True)
 
+            # Wait for Lustre to flush the log files to disk
+            time.sleep(10)
+
             if process.returncode == 0:
-                print(f"GPU job successful. Logging {model.id}.")
-                seen_models.append(model.id)
-                save_json_registry(TRACKER_FILE, seen_models)
+                print(f"GPU job SUCCESS. Marking {model.id} as COMPLETED.")
+                registry[model.id] = {"status": "COMPLETED", "date": TODAY}
             else:
-                print(f"ERROR: GPU job for {model.id} failed. It will not be marked as seen.")
-                print(f"Slurm Error Details: {process.stderr}")
-                failed_models.append(model.id)
-                save_json_registry(FAILED_FILE, failed_models)
+                rc = process.returncode
+                print(f"GPU job FAILED with Exit Code: {rc}")
+
+                if rc == 14:
+                    print(f"\n[CRITICAL ALERT] Developer Code Bug (Exit 14) detected for {model.id}.")
+                    print("HALTING ENTIRE PIPELINE TO PREVENT ENDLESS LOOPING.")
+                    sys.exit(1)
+                    
+                elif rc == 11:
+                    registry[model.id] = {"status": "MODEL_FAULT", "reason": "Incompatible Architecture (Exit 11)", "date": TODAY}
+                
+                elif rc == 12 or rc == 137 or rc == 9:
+                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": "Node/GPU Out of Memory", "date": TODAY}
+                    
+                elif rc == 10:
+                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": "Data/Path Error (Exit 10)", "date": TODAY}
+                    
+                else:
+                    # Catch-all for generic Slurm submission rejections (Usually Code 1 or 255)
+                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": f"Generic Slurm Rejection (Code {rc})", "date": TODAY}
             
-            print(f"GPU job finished. Letting Lustre file system sync before cleanup...")
-            time.sleep(10) # Prevent Errno 116 Stale File Handle
+            save_registry(registry)
+            
+            # Cleanup
+            print(f"Cleaning up {model.id} from Hugging Face cache...")
             safe_dir_name = "models--" + model.id.replace("/", "--")
             model_path = os.path.join(os.environ.get("HF_HOME"), "hub", safe_dir_name)
-
             if os.path.exists(model_path):
-                print(f"model found at {model_path} and will be removed")
                 shutil.rmtree(model_path)
 
-        
         except KeyboardInterrupt: 
-            print("Keyboard interruption, deleting the model")
-            safe_dir_name = "models--" + model.id.replace("/", "--")
-            model_path = os.path.join(os.environ.get("HF_HOME"), "hub", safe_dir_name)
-
-            if os.path.exists(model_path):
-                print(f"model found at {model_path} and will be removed")
-                shutil.rmtree(model_path)
+            print("Keyboard interruption, halting.")
+            sys.exit(0)
 
         except Exception as e:
-            print(f"Failed pipeline for {model.id}: {e}")
+            print(f"Unexpected Pipeline Failure for {model.id}: {e}")
+            registry[model.id] = {"status": "INFRA_FAULT", "reason": str(e), "date": TODAY}
+            save_registry(registry)
 
 if __name__ == "__main__":
     run_hf_generator()

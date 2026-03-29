@@ -4,6 +4,9 @@ import torch
 from diffusers import AutoPipelineForText2Image
 from prompt_manager import CSVPromptStreamer
 from dotenv import load_dotenv
+from datetime import datetime
+
+import traceback
 
 load_dotenv()
 
@@ -38,6 +41,11 @@ for _ in range(start_index):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float16 if device == "cuda" else torch.float32
 
+EXIT_DATA_FAULT = 10
+EXIT_MODEL_FAULT = 11
+EXIT_MEMORY_FAULT = 12
+EXIT_CODE_BUG = 14
+
 try:
     if model_type == "LoRA":
         print(f"Task {task_id}: Loading Base Model ({base_model_id}) for LoRA injection...")
@@ -68,6 +76,7 @@ try:
     
     # Batched Generation Loop
     batch_size = 3
+    today_date = datetime.now().strftime("%Y-%m-%d")
     
     for i in range(0, target_count_for_this_gpu, batch_size):
         # Prevent the final batch from generating too many images
@@ -80,7 +89,7 @@ try:
             # global_index ensures files are numbered correctly from 0 to 9999 across all nodes
             global_index = start_index + i + j
             safe_model_name = model_id.replace("/", "_")
-            filename = f"hf_{safe_model_name}_{global_index}.png"
+            filename = f"hf_{safe_model_name}_{today_date}_{global_index}.png"
             img.save(os.path.join(staging_dir, filename))
             
         if i % 100 < batch_size and i > 0:
@@ -88,6 +97,38 @@ try:
             
     print(f"Success! Task {task_id} finished generating for {model_id}", flush=True)
     
+except torch.cuda.OutOfMemoryError as e:
+    print(f"Task {task_id} VRAM OOM Error: {e}", flush=True)
+    sys.exit(EXIT_MEMORY_FAULT)
+
 except Exception as e:
-    print(f"Task {task_id} Generation failed: {e}", flush=True)
-    sys.exit(1)
+    error_msg = str(e)
+    error_msg_lower = error_msg.lower()
+    
+    # Catch Out of Memory strings (Sometimes thrown outside the specific torch class)
+    if "cuda out of memory" in error_msg_lower:
+        print(f"Task {task_id} VRAM OOM Error: {e}", flush=True)
+        sys.exit(EXIT_MEMORY_FAULT)
+        
+    # Distinguish File/Path Errors (model.json not found vs typo)
+    elif isinstance(e, FileNotFoundError) or isinstance(e, OSError) or "no such file or directory" in error_msg_lower:
+        
+        # Hugging Face explicitly complains about these files if the repo isn't a valid Diffusers model
+        hf_keywords = ["model_index.json", "config.json", "scheduler", "huggingface", "safetensors"]
+        
+        if any(keyword in error_msg_lower for keyword in hf_keywords):
+            print(f"Task {task_id} Model Fault: Missing diffusers config/architecture: {e}", flush=True)
+            sys.exit(EXIT_MODEL_FAULT) # Code 11: Blacklist the model
+        else:
+            print(f"Task {task_id} Data/Path Error (Likely a typo in your paths): {e}", flush=True)
+            sys.exit(EXIT_DATA_FAULT) # Code 10: Halt and let you fix the typo
+
+    # Catch generic architecture mismatches
+    elif "weight" in error_msg_lower or "pipeline" in error_msg_lower or "expected str" in error_msg_lower:
+        print(f"Task {task_id} Model Architecture Error: {e}", flush=True)
+        sys.exit(EXIT_MODEL_FAULT) # Code 11: Blacklist the model
+        
+    # Catch-all for absolute Code Bugs (Syntax, Indentation, TypeErrors)
+    else:
+        print(f"Task {task_id} CRITICAL CODE BUG:\n{traceback.format_exc()}", flush=True)
+        sys.exit(EXIT_CODE_BUG) # Code 14: Kill the coordinator

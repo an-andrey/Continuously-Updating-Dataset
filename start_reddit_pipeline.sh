@@ -15,10 +15,10 @@ fi
 
 # Create date-organized directories
 mkdir -p data/slurm_logs/$TODAY
-mkdir -p data/logs
+mkdir -p data/logs/reddit/$TODAY
 
 # Define the main coordinator log file
-LOG_FILE="data/logs/reddit_$NOW.log"
+LOG_FILE="data/logs/reddit/$TODAY/reddit_$NOW.log"
 
 echo "========================================"
 echo " Starting Reddit Scraping Pipeline"

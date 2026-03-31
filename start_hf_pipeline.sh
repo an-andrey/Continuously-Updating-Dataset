@@ -8,10 +8,10 @@ NOW=$(date +"%Y-%m-%d_%H-%M-%S")
 
 # Create date-organized directories
 mkdir -p data/slurm_logs/$TODAY
-mkdir -p data/logs
+mkdir -p data/logs/pipeline/$TODAY
 
 # Define the main coordinator log file
-LOG_FILE="data/logs/pipeline_$NOW.log"
+LOG_FILE="data/logs/pipeline/$TODAY/pipeline_$NOW.log"
 
 echo "========================================"
 echo " Starting HF Dataset Generation Pipeline"

@@ -138,7 +138,7 @@ def run_hf_generator():
             if target_count >= 10000: array_tasks = 5  
             elif target_count >= 5000: array_tasks = 2  
             else: array_tasks = 1  
-                
+            
             print(f"Submitting Array ({array_tasks} tasks) to slurm_logs/{TODAY}/...")
             
             process = subprocess.run([
@@ -161,34 +161,47 @@ def run_hf_generator():
                 registry[model.id] = {"status": "COMPLETED", "date": TODAY}
             else:
                 rc = process.returncode
-                print(f"GPU job FAILED with Exit Code: {rc}")
 
                 if rc == 14:
-                    print(f"\n[CRITICAL ALERT] Developer Code Bug (Exit 14) detected for {model.id}.")
+                    err_name, status_type = "Critical Code Bug", "HALT"
+                elif rc == 11:
+                    err_name, status_type = "Incompatible Architecture", "MODEL_FAULT"
+                elif rc in [12, 137, 9]:
+                    err_name, status_type = "Node/GPU Out of Memory", "INFRASTRUCTURE_FAULT"
+                elif rc == 10:
+                    err_name, status_type = "Data/Path Typo", "INFRASTRUCTURE_FAULT"
+                else:
+                    err_name, status_type = f"Generic Slurm/Job Failure", "INFRASTRUCTURE_FAULT"
+
+                print(f"GPU job FAILED with Exit Code {rc} -> [{err_name}]")
+
+                if status_type == "HALT":
+                    print(f"\n[CRITICAL ALERT] Developer Code Bug detected for {model.id}.")
                     print("HALTING ENTIRE PIPELINE TO PREVENT ENDLESS LOOPING.")
                     sys.exit(1)
                     
-                elif rc == 11:
-                    registry[model.id] = {"status": "MODEL_FAULT", "reason": "Incompatible Architecture (Exit 11)", "date": TODAY}
-                
-                elif rc == 12 or rc == 137 or rc == 9:
-                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": "Node/GPU Out of Memory", "date": TODAY}
+                elif status_type == "MODEL_FAULT":
+                    print(f"Model BLACKLISTED. It will NOT be retried on future runs.")
+                    registry[model.id] = {"status": "MODEL_FAULT", "reason": f"{err_name} (Exit {rc})", "date": TODAY}
                     
-                elif rc == 10:
-                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": "Data/Path Error (Exit 10)", "date": TODAY}
-                    
-                else:
-                    # Catch-all for generic Slurm submission rejections (Usually Code 1 or 255)
-                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": f"Generic Slurm Rejection (Code {rc})", "date": TODAY}
+                elif status_type == "INFRASTRUCTURE_FAULT":
+                    print(f"Flagged for RETRY. It will be attempted again on the next pipeline run.")
+                    registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": f"{err_name} (Exit {rc})", "date": TODAY}
             
             save_registry(registry)
             
-            # Cleanup
-            print(f"Cleaning up {model.id} from Hugging Face cache...")
-            safe_dir_name = "models--" + model.id.replace("/", "--")
-            model_path = os.path.join(os.environ.get("HF_HOME"), "hub", safe_dir_name)
-            if os.path.exists(model_path):
-                shutil.rmtree(model_path)
+            # Only delete the heavy weights from the hard drive if we are permanently done with the model
+            current_status = registry.get(model.id, {}).get("status")
+
+            if current_status != "INFRASTRUCTURE_FAULT":
+                print(f"Cleaning up {model.id} from Hugging Face cache to save space...")
+                safe_dir_name = "models--" + model.id.replace("/", "--")
+                model_path = os.path.join(os.environ.get("HF_HOME"), "hub", safe_dir_name)
+                if os.path.exists(model_path):
+                    shutil.rmtree(model_path)
+
+            else:
+                print(f"Keeping {model.id} in cache to save download time on the next retry.")
 
         except KeyboardInterrupt: 
             print("Keyboard interruption, halting.")
@@ -196,7 +209,7 @@ def run_hf_generator():
 
         except Exception as e:
             print(f"Unexpected Pipeline Failure for {model.id}: {e}")
-            registry[model.id] = {"status": "INFRA_FAULT", "reason": str(e), "date": TODAY}
+            registry[model.id] = {"status": "INFRASTRUCTURE_FAULT", "reason": str(e), "date": TODAY}
             save_registry(registry)
 
 if __name__ == "__main__":

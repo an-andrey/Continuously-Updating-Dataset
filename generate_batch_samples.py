@@ -5,6 +5,7 @@ from diffusers import AutoPipelineForText2Image
 from prompt_manager import CSVPromptStreamer
 from dotenv import load_dotenv
 from datetime import datetime
+import gc
 
 import traceback
 
@@ -55,7 +56,7 @@ try:
             use_safetensors=True,
             requires_safety_checker=False,
             local_files_only=True
-        ).to(device)
+        )
         print(f"Task {task_id}: Injecting LoRA weights from {model_id}...")
         pipeline.load_lora_weights(model_id, local_files_only=True)
     else:
@@ -66,70 +67,109 @@ try:
             use_safetensors=True,
             requires_safety_checker=False,
             local_files_only=True
-        ).to(device)
+        )
     
-    # Offloads sub-components to standard RAM when not actively being used
-    pipeline.enable_model_cpu_offload() 
+    #Params to reduce GPU/CPU usage 
+    if hasattr(pipeline, "enable_model_cpu_offload"):
+        pipeline.enable_model_cpu_offload() 
+        print(f"Task {task_id}: CPU offloading enabled. (Safely handling VRAM)", flush=True)
+    else:
+        pipeline = pipeline.to(device)
+        print(f"Task {task_id}: Model manually moved to GPU.", flush=True)
 
-    # Decodes the batch of images one-by-one at the very end instead of all at once
-    pipeline.enable_vae_slicing()
-    pipeline.enable_vae_tiling()
+    if hasattr(pipeline, "enable_vae_slicing"):
+        pipeline.enable_vae_slicing()
+        print(f"Task {task_id}: VAE slicing enabled.", flush=True)
+
+    if hasattr(pipeline, "enable_vae_tiling"):
+        pipeline.enable_vae_tiling()
+        print(f"Task {task_id}: VAE tiling enabled.", flush=True)
     
-    # Batched Generation Loop
-    batch_size = 6
+    optimal_batch_size = 12 # Start greedy, half it every time cuda out of memory
+    images_generated = 0
+    pending_prompts = []    # Cache prompts so we don't lose them if a batch fails
     today_date = datetime.now().strftime("%Y-%m-%d")
     
-    for i in range(0, target_count_for_this_gpu, batch_size):
-        # Prevent the final batch from generating too many images
-        current_batch_size = min(batch_size, target_count_for_this_gpu - i)
+    while images_generated < target_count_for_this_gpu:
+        current_chunk_size = min(optimal_batch_size, target_count_for_this_gpu - images_generated)
         
-        prompts = [prompt_generator.get_next_prompt() for _ in range(current_batch_size)]
-        results = pipeline(prompts)
+        # Buffer prompts so we don't skip them if the batch fails
+        while len(pending_prompts) < current_chunk_size:
+            pending_prompts.append(prompt_generator.get_next_prompt())
+            
+        attempt_prompts = pending_prompts[:current_chunk_size]
         
-        for j, img in enumerate(results.images):
-            # global_index ensures files are numbered correctly from 0 to 9999 across all nodes
-            global_index = start_index + i + j
-            safe_model_name = model_id.replace("/", "_")
-            filename = f"hf_{safe_model_name}_{today_date}_{global_index}.png"
-            img.save(os.path.join(staging_dir, filename))
+        try:
+            results = pipeline(prompt=attempt_prompts)
             
-        if i % 100 < batch_size and i > 0:
-            print(f"Task {task_id} generated {i}/{target_count_for_this_gpu} images...", flush=True)
+            for j, img in enumerate(results.images):
+                # global_index ensures files are numbered correctly from 0 to 9999 across all nodes
+                global_index = start_index + images_generated + j
+                safe_model_name = model_id.replace("/", "_")
+                filename = f"hf_{safe_model_name}_{today_date}_{global_index}.png"
+                img.save(os.path.join(staging_dir, filename))
+                
+            images_generated += current_chunk_size
+            pending_prompts = [] # Clear cached prompts on success
             
+            if images_generated % 100 < optimal_batch_size and images_generated > 0:
+                print(f"Task {task_id} generated {images_generated}/{target_count_for_this_gpu}... (Locked Batch Size: {optimal_batch_size})", flush=True)
+
+        # Catch PyTorch OOMs *inside* the loop so we can retry instead of crashing
+        except torch.cuda.OutOfMemoryError as e:
+            print(f"Task {task_id} VRAM Overload at batch {optimal_batch_size}. Flushing memory...", flush=True)
+            gc.collect()
+            torch.cuda.empty_cache()
+            
+            if optimal_batch_size == 1:
+                print(f"Task {task_id} FATAL: Model too large for 1 image.", flush=True)
+                sys.exit(EXIT_MEMORY_FAULT)
+                
+            optimal_batch_size = max(1, optimal_batch_size // 2)
+            print(f"Task {task_id}: Halved batch size. Retrying with {optimal_batch_size}...", flush=True)
+
+        except Exception as inner_e:
+            # Catch sneaky generic string OOMs, otherwise escalate to the outer try/except block
+            if "cuda out of memory" in str(inner_e).lower() or "oom" in str(inner_e).lower():
+                print(f"Task {task_id} VRAM Overload at batch {optimal_batch_size}. Flushing memory...", flush=True)
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                if optimal_batch_size == 1:
+                    print(f"Task {task_id} FATAL: Model too large for 1 image.", flush=True)
+                    sys.exit(EXIT_MEMORY_FAULT)
+                    
+                optimal_batch_size = max(1, optimal_batch_size // 2)
+                print(f"Task {task_id}: Halved batch size. Retrying with {optimal_batch_size}...", flush=True)
+            else:
+                # Escalates things like Architecture Errors to the outer catch
+                raise inner_e 
+
     print(f"Success! Task {task_id} finished generating for {model_id}", flush=True)
     
-except torch.cuda.OutOfMemoryError as e:
-    print(f"Task {task_id} VRAM OOM Error: {e}", flush=True)
-    sys.exit(EXIT_MEMORY_FAULT)
-
 except Exception as e:
     error_msg = str(e)
     error_msg_lower = error_msg.lower()
     
-    # Catch Out of Memory strings (Sometimes thrown outside the specific torch class)
     if "cuda out of memory" in error_msg_lower:
-        print(f"Task {task_id} VRAM OOM Error: {e}", flush=True)
+        print(f"Task {task_id} VRAM OOM Error during init: {e}", flush=True)
         sys.exit(EXIT_MEMORY_FAULT)
         
-    # Distinguish File/Path Errors (model.json not found vs typo)
     elif isinstance(e, FileNotFoundError) or isinstance(e, OSError) or "no such file or directory" in error_msg_lower:
-        
-        # Hugging Face explicitly complains about these files if the repo isn't a valid Diffusers model
         hf_keywords = ["model_index.json", "config.json", "scheduler", "huggingface", "safetensors"]
         
         if any(keyword in error_msg_lower for keyword in hf_keywords):
             print(f"Task {task_id} Model Fault: Missing diffusers config/architecture: {e}", flush=True)
-            sys.exit(EXIT_MODEL_FAULT) # Code 11: Blacklist the model
+            sys.exit(EXIT_MODEL_FAULT) 
         else:
             print(f"Task {task_id} Data/Path Error (Likely a typo in your paths): {e}", flush=True)
-            sys.exit(EXIT_DATA_FAULT) # Code 10: Halt and let you fix the typo
+            sys.exit(EXIT_DATA_FAULT) 
 
-    # Catch generic architecture mismatches
-    elif "weight" in error_msg_lower or "pipeline" in error_msg_lower or "expected str" in error_msg_lower:
+    # FIX 2: Moved architecture mismatch keywords here
+    elif any(kw in error_msg_lower for kw in ["weight", "pipeline", "expected str", "time embedding", "incorrect config", "dimension"]):
         print(f"Task {task_id} Model Architecture Error: {e}", flush=True)
-        sys.exit(EXIT_MODEL_FAULT) # Code 11: Blacklist the model
+        sys.exit(EXIT_MODEL_FAULT) 
         
-    # Catch-all for absolute Code Bugs (Syntax, Indentation, TypeErrors)
     else:
         print(f"Task {task_id} CRITICAL CODE BUG:\n{traceback.format_exc()}", flush=True)
-        sys.exit(EXIT_CODE_BUG) # Code 14: Kill the coordinator
+        sys.exit(EXIT_CODE_BUG)

@@ -40,7 +40,7 @@ for _ in range(start_index):
     prompt_generator.get_next_prompt()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-torch_dtype = torch.float16 if device == "cuda" else torch.float32
+torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 EXIT_DATA_FAULT = 10
 EXIT_MODEL_FAULT = 11

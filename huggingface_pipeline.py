@@ -1,3 +1,11 @@
+"""
+Main HuggingFace pipeline code. start it with `./start_hf_pipeline.sh`
+OUTPUT: Stores generated images in STAGING_DIR, saves seen models in REGISTRY_FILE and logs in LOG_FILE (see starting bash file)
+
+Scans through HF diffusion models, and if it fits, requests a certain amount of prompts ( see classify_model function ) through generate_batch_samples.py
+"""
+
+
 import os
 import json
 import torch

@@ -1,3 +1,14 @@
+"""
+Generates TOTAL_AMT_IMAGES_TO_GENERATE of MODEL_ID
+If it's a LoRA model, the BASE_MODEL_ID is used instead with the weights
+Images are stored in STAGING_DIR
+
+Usage:
+Called automatically from hugging_face_pipeline.py --> submit_generate_batch_samples.sh but can be called directly as 
+
+python generate_batch_samples MODEL_ID TOTAL_AMT_IMAGES_TO_GENERATE MODEL_TYPE BASE_MODEL_ID
+"""
+
 import os
 import sys
 import torch
@@ -11,27 +22,33 @@ import traceback
 
 load_dotenv()
 
-model_id = sys.argv[1]
-total_target_count = int(sys.argv[2])
-model_type = sys.argv[3]
-base_model_id = sys.argv[4]
+STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
+MODEL_ID = sys.argv[1]
+TOTAL_AMT_IMAGES_TO_GENERATE = int(sys.argv[2])
+MODEL_TYPE = sys.argv[3]
+BASE_MODEL_ID = sys.argv[4]
+
+# Error codes
+EXIT_DATA_FAULT = 10
+EXIT_MODEL_FAULT = 11
+EXIT_MEMORY_FAULT = 12
+EXIT_CODE_BUG = 14
 
 # Array Logic: Determine this GPU's workload
 task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
 task_count = int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1))
 
-images_per_task = total_target_count // task_count
+images_per_task = TOTAL_AMT_IMAGES_TO_GENERATE // task_count
 start_index = task_id * images_per_task
 end_index = start_index + images_per_task
 
 # Ensure the final task picks up any remainder due to uneven division
 if task_id == task_count - 1:
-    end_index = total_target_count
+    end_index = TOTAL_AMT_IMAGES_TO_GENERATE
 
 target_count_for_this_gpu = end_index - start_index
 
-staging_dir = "/home/aandrey/links/scratch/data/staging_images"
-os.makedirs(staging_dir, exist_ok=True)
+os.makedirs(STAGING_DIR, exist_ok=True)
 
 prompt_generator = CSVPromptStreamer()
 
@@ -42,27 +59,22 @@ for _ in range(start_index):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-EXIT_DATA_FAULT = 10
-EXIT_MODEL_FAULT = 11
-EXIT_MEMORY_FAULT = 12
-EXIT_CODE_BUG = 14
-
 try:
-    if model_type == "LoRA":
-        print(f"Task {task_id}: Loading Base Model ({base_model_id}) for LoRA injection...")
+    if MODEL_TYPE == "LoRA":
+        print(f"Task {task_id}: Loading Base Model ({BASE_MODEL_ID}) for LoRA injection...")
         pipeline = AutoPipelineForText2Image.from_pretrained(
-            base_model_id, 
+            BASE_MODEL_ID, 
             torch_dtype=torch_dtype,
             use_safetensors=True,
             requires_safety_checker=False,
             local_files_only=True
         )
-        print(f"Task {task_id}: Injecting LoRA weights from {model_id}...")
-        pipeline.load_lora_weights(model_id, local_files_only=True)
+        print(f"Task {task_id}: Injecting LoRA weights from {MODEL_ID}...")
+        pipeline.load_lora_weights(MODEL_ID, local_files_only=True)
     else:
-        print(f"Task {task_id}: Loading standalone model ({model_id})...")
+        print(f"Task {task_id}: Loading standalone model ({MODEL_ID})...")
         pipeline = AutoPipelineForText2Image.from_pretrained(
-            model_id, 
+            MODEL_ID, 
             torch_dtype=torch_dtype,
             use_safetensors=True,
             requires_safety_checker=False,
@@ -105,9 +117,9 @@ try:
             for j, img in enumerate(results.images):
                 # global_index ensures files are numbered correctly from 0 to 9999 across all nodes
                 global_index = start_index + images_generated + j
-                safe_model_name = model_id.replace("/", "_")
+                safe_model_name = MODEL_ID.replace("/", "_")
                 filename = f"hf_{safe_model_name}_{today_date}_{global_index}.png"
-                img.save(os.path.join(staging_dir, filename))
+                img.save(os.path.join(STAGING_DIR, filename))
                 
             images_generated += current_chunk_size
             pending_prompts = [] # Clear cached prompts on success
@@ -145,7 +157,7 @@ try:
                 # Escalates things like Architecture Errors to the outer catch
                 raise inner_e 
 
-    print(f"Success! Task {task_id} finished generating for {model_id}", flush=True)
+    print(f"Success! Task {task_id} finished generating for {MODEL_ID}", flush=True)
     
 except Exception as e:
     error_msg = str(e)

@@ -1,23 +1,6 @@
-# import random
-# from datasets import load_dataset
-
-# class ReLaionPromptStreamer:
-#     def __init__(self, dataset_path="supermodelresearch/Re-LAION-Caption19M"):
-#         print(f"Initializing stream from {dataset_path}")
-#         # We use streaming=True to avoid downloading entire dataset
-#         self.dataset = load_dataset(dataset_path, split="train", streaming=True)
-#         self.shuffled_stream = self.dataset.shuffle(seed=random.randint(0, 100_000), buffer_size=10_000)
-#         self.iterator = iter(self.shuffled_stream)
-
-#     def get_next_prompt(self):
-#         try:
-#             sample = next(self.iterator)
-#             return sample['caption']
-        
-#         except StopIteration:
-#             # If we hit the end, restart the stream
-#             self.iterator = iter(self.shuffled_stream)
-#             return self.get_next_prompt()
+"""
+Creates a streamer class to pass prompts to the models. Prompts come from filepath var
+"""
 
 import pandas as pd
 import random

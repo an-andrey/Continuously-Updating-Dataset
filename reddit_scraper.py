@@ -1,3 +1,7 @@
+"""
+Scrapes TARGET_SUBREDDITS and saves 
+"""
+
 import praw, os, requests
 from datetime import datetime, timezone, timedelta
 import pandas as pd
@@ -9,6 +13,10 @@ import cv2
 load_dotenv()
 
 TARGET_SUBREDDITS = ["aigeneratedart", "aiArt", "midjourney", "aiimages", "AiArtwork", "AiGeneratedArt", "Pro_Ai_Art", "AI_ART", "aivideo", "AIVideos_SFW", "GenAIGallery", "deepdream", "nanobanana2pro", "nanobanana2ai", "nanobananaSFW"]
+REDDIT_STAGING_DIR = "/home/aandrey/links/scratch/data/reddit_images"
+NUM_OF_VIDEO_FRAMES = 15 
+DAYS_AGO = 1
+
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
 def download_file(url, filepath):
@@ -23,7 +31,7 @@ def download_file(url, filepath):
     except:
         return False
     
-def extract_video_frames(video_path, output_dir, base_filename, num_frames=5):
+def extract_video_frames(video_path, output_dir, base_filename, num_frames=NUM_OF_VIDEO_FRAMES):
     """Extracts a fixed number of frames evenly distributed across a video."""
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -49,7 +57,7 @@ def extract_video_frames(video_path, output_dir, base_filename, num_frames=5):
                 
     cap.release()
 
-def run_reddit_scraper(staging_dir = "/home/aandrey/links/scratch/data/reddit_images", days_ago=1):
+def run_reddit_scraper(staging_dir = REDDIT_STAGING_DIR, days_ago=1):
     credsfile = "data/creds/creds.csv"
     cdf = pd.read_csv(credsfile, sep=',')
     creds = cdf[(cdf['datatype'] == 'submissions')].to_dict(orient='records')[0]
@@ -91,7 +99,7 @@ def run_reddit_scraper(staging_dir = "/home/aandrey/links/scratch/data/reddit_im
                 
                 if download_file(video_url, video_filepath):
                     # Set num_frames to however many images you want per video
-                    extract_video_frames(video_filepath, staging_dir, base_name, num_frames=15)
+                    extract_video_frames(video_filepath, staging_dir, base_name, num_frames=NUM_OF_VIDEO_FRAMES)
                     
                     # Delete the temporary mp4 file to save disk space
                     if os.path.exists(video_filepath):

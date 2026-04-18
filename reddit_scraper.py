@@ -12,7 +12,10 @@ import cv2
 
 load_dotenv()
 
-TARGET_SUBREDDITS = ["aigeneratedart", "aiArt", "midjourney", "aiimages", "AiArtwork", "AiGeneratedArt", "Pro_Ai_Art", "AI_ART", "aivideo", "AIVideos_SFW", "GenAIGallery", "deepdream", "nanobanana2pro", "nanobanana2ai", "nanobananaSFW"]
+TARGET_SUBREDDITS = ["aigeneratedart", "aiArt", "midjourney", "aiimages", "AiArtwork", "AiGeneratedArt",
+                    "Pro_Ai_Art", "AI_ART", "aivideo", "AIVideos_SFW", "GenAIGallery", "deepdream", "nanobanana2pro",
+                    "nanobanana2ai", "nanobananaSFW", "VEO3", "Seedance_A", "KlingAI_Videos", "GrokImage"]
+
 REDDIT_STAGING_DIR = "/home/aandrey/links/scratch/data/reddit_images"
 NUM_OF_VIDEO_FRAMES = 15 
 DAYS_AGO = 1

@@ -131,6 +131,7 @@ def run_hf_generator():
         is_video_model = "video" in pipeline_task.lower()
         model_type, target_count, base_model_id = classify_model(model)
         safe_model_name = model.id.replace("/", "_")
+        release_date = model.created_at.strftime("%Y-%m-%d") if getattr(model, "created_at", None) else "unknown"
 
         print(f"\n--- Processing {model.id} ({model_type}) ---")
         
@@ -151,7 +152,7 @@ def run_hf_generator():
             
             print(f"Submitting Array ({array_tasks} tasks) to slurm_logs/{TODAY}/...")
             
-            task_script = "submit_generate_video_samples.sh" if is_video_model else "submit_generate_video_samples"
+            task_script = "submit_generate_video_samples.sh" if is_video_model else "submit_generate_batch_samples.sh"
 
             process = subprocess.run([
                 "sbatch", 
@@ -162,7 +163,8 @@ def run_hf_generator():
                 model.id, 
                 str(target_count), 
                 model_type, 
-                base_model_id
+                base_model_id,
+                release_date,
             ], capture_output=True, text=True)
 
             # Wait for Lustre to flush the log files to disk
@@ -226,5 +228,3 @@ def run_hf_generator():
 
 if __name__ == "__main__":
     run_hf_generator()
-
-

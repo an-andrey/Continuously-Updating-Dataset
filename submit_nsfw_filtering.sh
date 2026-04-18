@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4           
 #SBATCH --mem=31G                      
 
-module load StdEnv/2023 python/3.11
+module load StdEnv/2023 python/3.11 opencv/4.11.0
 source /home/aandrey/links/projects/def-rrabba/aandrey/Continuously-Updating-Dataset/.venv/bin/activate
 
 # Execute the generator. Slurm automatically exports array variables.

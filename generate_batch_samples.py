@@ -1,23 +1,24 @@
 """
 Generates TOTAL_AMT_IMAGES_TO_GENERATE of MODEL_ID
 If it's a LoRA model, the BASE_MODEL_ID is used instead with the weights
-Images are stored in STAGING_DIR
+Images are stored in STAGING_DIR, metadata appended to a per-model CSV
 
 Usage:
 Called automatically from hugging_face_pipeline.py --> submit_generate_batch_samples.sh but can be called directly as 
 
-python generate_batch_samples MODEL_ID TOTAL_AMT_IMAGES_TO_GENERATE MODEL_TYPE BASE_MODEL_ID
+python generate_batch_samples.py MODEL_ID TOTAL_AMT_IMAGES_TO_GENERATE MODEL_TYPE BASE_MODEL_ID RELEASE_DATE
 """
 
 import os
 import sys
+import csv
+import fcntl
 import torch
-from diffusers import AutoPipelineForText2Image
+from diffusers import AutoPipelineForText2Image, DiffusionPipeline
 from prompt_manager import CSVPromptStreamer
 from dotenv import load_dotenv
 from datetime import datetime
 import gc
-
 import traceback
 
 load_dotenv()
@@ -27,6 +28,11 @@ MODEL_ID = sys.argv[1]
 TOTAL_AMT_IMAGES_TO_GENERATE = int(sys.argv[2])
 MODEL_TYPE = sys.argv[3]
 BASE_MODEL_ID = sys.argv[4]
+RELEASE_DATE = sys.argv[5]
+
+METADATA_FIELDS = ["filename", "prompt", "label", "model", "type", "release_date"]
+safe_model_name = MODEL_ID.replace("/", "_")
+METADATA_CSV = os.path.join(STAGING_DIR, f"metadata_{safe_model_name}.csv")
 
 # Error codes
 EXIT_DATA_FAULT = 10
@@ -59,6 +65,20 @@ for _ in range(start_index):
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
+
+def append_metadata_rows(rows):
+    """Append metadata rows to the per-model CSV with file locking for array task safety."""
+    file_exists = os.path.exists(METADATA_CSV) and os.path.getsize(METADATA_CSV) > 0
+    with open(METADATA_CSV, "a", newline="") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        writer = csv.DictWriter(f, fieldnames=METADATA_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+        fcntl.flock(f, fcntl.LOCK_UN)
+
+
 try:
     if MODEL_TYPE == "LoRA":
         print(f"Task {task_id}: Loading Base Model ({BASE_MODEL_ID}) for LoRA injection...")
@@ -73,14 +93,21 @@ try:
         pipeline.load_lora_weights(MODEL_ID, local_files_only=True)
     else:
         print(f"Task {task_id}: Loading standalone model ({MODEL_ID})...")
-        pipeline = AutoPipelineForText2Image.from_pretrained(
-            MODEL_ID, 
-            torch_dtype=torch_dtype,
-            use_safetensors=True,
-            requires_safety_checker=False,
-            local_files_only=True
-        )
-    
+        try:
+            pipeline = AutoPipelineForText2Image.from_pretrained(
+                MODEL_ID, 
+                torch_dtype=torch_dtype,
+                use_safetensors=True,
+                requires_safety_checker=False,
+                local_files_only=True
+            )
+        except Exception as e:
+            print(f"AutoPipeline failed: {e}. Trying DiffusionPipeline...", flush=True)
+            pipeline = DiffusionPipeline.from_pretrained(
+                MODEL_ID, torch_dtype=torch_dtype,
+                use_safetensors=True, local_files_only=True
+            )
+            
     #Params to reduce GPU/CPU usage 
     if hasattr(pipeline, "enable_model_cpu_offload"):
         pipeline.enable_model_cpu_offload() 
@@ -114,12 +141,24 @@ try:
         try:
             results = pipeline(prompt=attempt_prompts)
             
+            metadata_batch = []
             for j, img in enumerate(results.images):
                 # global_index ensures files are numbered correctly from 0 to 9999 across all nodes
                 global_index = start_index + images_generated + j
-                safe_model_name = MODEL_ID.replace("/", "_")
                 filename = f"hf_{safe_model_name}_{today_date}_{global_index}.png"
                 img.save(os.path.join(STAGING_DIR, filename))
+                
+                metadata_batch.append({
+                    "filename": filename,
+                    "prompt": attempt_prompts[j],
+                    "label": "fake",
+                    "model": MODEL_ID,
+                    "type": MODEL_TYPE,
+                    "release_date": RELEASE_DATE,
+                })
+            
+            # Write all metadata for this batch in one locked operation
+            append_metadata_rows(metadata_batch)
                 
             images_generated += current_chunk_size
             pending_prompts = [] # Clear cached prompts on success
@@ -177,7 +216,6 @@ except Exception as e:
             print(f"Task {task_id} Data/Path Error (Likely a typo in your paths): {e}", flush=True)
             sys.exit(EXIT_DATA_FAULT) 
 
-    # FIX 2: Moved architecture mismatch keywords here
     elif any(kw in error_msg_lower for kw in ["weight", "pipeline", "expected str", "time embedding", "incorrect config", "dimension"]):
         print(f"Task {task_id} Model Architecture Error: {e}", flush=True)
         sys.exit(EXIT_MODEL_FAULT) 

@@ -33,7 +33,7 @@ MODEL_ID = "google/gemma-3-27b-it"
 NARRATIVES_FILE = os.path.join(LABELS_DIR, "localized_narratives_train.jsonl")
 RELATIONSHIPS_FILE = os.path.join(LABELS_DIR, "oidv6-train-annotations-vrd.csv")
 
-BATCH_SIZE = 16  # Smaller batches for 27B model
+BATCH_SIZE = 32
 
 
 def parse_args():
@@ -193,7 +193,7 @@ def load_model_and_tokenizer():
     print(f"Loading model from {MODEL_ID}...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
-        torch_dtype=torch.float16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         local_files_only=True,
     )
@@ -206,77 +206,42 @@ def load_model_and_tokenizer():
 # ---------------------------------------------------------------------------
 # Prompt generation
 # ---------------------------------------------------------------------------
-SYSTEM_PROMPT = (
-    "You are an image inpainting assistant. Given context about an image and an object to replace, "
-    "output ONLY a short descriptive phrase (3-8 words) for a creative, realistic replacement. "
-    "No explanations. No quotes. No prefixes. Just the phrase.\n"
-)
+def build_user_message(row, narratives, relationships, scene_objects):
+    """Build a prompt asking for a JSON-structured inpainting prompt."""
+    image_id = row["ImageID"]
+    target = row["ClassName"]
 
+    # Build context from best available source
+    if image_id in narratives:
+        context = f'This photo is described as: "{narratives[image_id]}"'
+    elif image_id in relationships:
+        rels = "; ".join(relationships[image_id])
+        context = f"This photo shows: {rels}"
+    elif image_id in scene_objects:
+        objs = ", ".join(scene_objects[image_id])
+        context = f"This photo contains: {objs}"
+    else:
+        context = f"A photo contains a {target}"
 
-def clean_response(response, fallback_class):
-    """Clean Gemma's output to extract just the replacement phrase."""
-    # Strip common preamble artifacts (loop to catch stacked prefixes)
-    prefixes = ["model", "sure,", "sure!", "here is", "here's",
-                "output:", "answer:", "replacement:", "->", "→",
-                "the replacement prompt:", "the replacement prompt is:",
-                "a fitting replacement:", "replacement prompt:"]
-    changed = True
-    while changed:
-        changed = False
-        stripped = response.lstrip()
-        for prefix in prefixes:
-            if stripped.lower().startswith(prefix):
-                response = stripped[len(prefix):].lstrip()
-                changed = True
-                break
-
-    # Take only the first line
-    response = response.split("\n")[0].strip()
-
-    # Remove markdown, quotes, bullets
-    response = re.sub(r'^[\s*>#\-•"\'`]+', '', response)
-    response = re.sub(r'[\s*>#"\'`]+$', '', response)
-    response = response.strip()
-
-    # Remove "a replacement for X:" type prefixes
-    response = re.sub(
-        r'^(a |an )?(suitable |fitting |realistic )?replacement( for \w+)?[:\-]\s*',
-        '', response, flags=re.IGNORECASE
+    return (
+        f"{context}\n\n"
+        f"I'm going to use an AI inpainting model on the {target} in this image. "
+        f"Give me a prompt describing what the {target} area should be changed to after inpainting. "
+        f"Think about things like, but not limited to: changing the material or texture, applying a different pattern or color scheme, "
+        f"swapping it for a similar but different object, changing the style or era, removing it to reveal what's behind, "
+        f"or making it look like it's made of an unexpected substance. Keep it grounded and realistic — "
+        f"avoid fantasy, sci-fi, glowing, bioluminescent, or ethereal themes. "
+        f'Respond with a JSON object containing a single key "prompt" with your inpainting prompt as the value.'
     )
-    # Remove "Describe a..." prefixes
-    response = re.sub(
-        r'^describe (a |an )?.*?[:\-]\s*',
-        '', response, flags=re.IGNORECASE
-    )
-    response = response.strip()
-
-    # Reject garbage responses
-    reject_patterns = ["unable", "cannot", "can't", "don't", "i am", "i'm",
-                       "sorry", "as an ai", "not possible", "no replacement",
-                       "describe a", "provide a", "i do not", "instead of",
-                       "in the context", "in the image"]
-    if (len(response) < 3 or
-            len(response) > 100 or
-            any(p in response.lower() for p in reject_patterns)):
-        return f"a different {fallback_class.lower()}"
-
-    # Ensure it starts with an article for consistency
-    if not response.startswith(("A ", "An ", "a ", "an ", "the ", "The ")):
-        response = "a " + response[0].lower() + response[1:]
-
-    return response
 
 
 def generate_prompts_batch(tokenizer, model, batch_df, device,
                            narratives, relationships, scene_objects):
+    """Generate inpainting prompts in a batch."""
     messages_batch = []
     for _, row in batch_df.iterrows():
-        context, tier = get_context_for_row(row, narratives, relationships, scene_objects)
-
-        user_message = f"{SYSTEM_PROMPT}\n{context} ->"
-        messages_batch.append(
-            [{"role": "user", "content": user_message}]
-        )
+        user_message = build_user_message(row, narratives, relationships, scene_objects)
+        messages_batch.append([{"role": "user", "content": user_message}])
 
     formatted_prompts = [
         tokenizer.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
@@ -296,9 +261,9 @@ def generate_prompts_batch(tokenizer, model, batch_df, device,
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
-            max_new_tokens=20,
+            max_new_tokens=256,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.9,
         )
 
     results = []
@@ -306,11 +271,30 @@ def generate_prompts_batch(tokenizer, model, batch_df, device,
         response = tokenizer.decode(
             outputs[j][input_lengths[j]:], skip_special_tokens=True
         ).strip()
-        fallback_class = batch_df.iloc[j]["ClassName"]
-        response = clean_response(response, fallback_class)
-        results.append(response)
+        results.append(extract_prompt(response))
 
     return results
+
+
+def extract_prompt(response):
+    """Extract the prompt value from JSON response. No cleaning, just parse."""
+    import json as json_module
+
+    # Try direct JSON parse
+    try:
+        data = json_module.loads(response)
+        if isinstance(data, dict) and "prompt" in data:
+            return data["prompt"].strip()
+    except (json_module.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON embedded in the response (model sometimes adds text around it)
+    json_match = re.search(r'\{[^{}]*"prompt"\s*:\s*"([^"]+)"[^{}]*\}', response)
+    if json_match:
+        return json_match.group(1).strip()
+
+    # If no JSON at all, return the raw response as-is
+    return response.strip()
 
 
 # ---------------------------------------------------------------------------

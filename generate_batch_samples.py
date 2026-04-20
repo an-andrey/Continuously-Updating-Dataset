@@ -99,13 +99,15 @@ try:
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
                 requires_safety_checker=False,
-                local_files_only=True
+                local_files_only=True,
+                trust_remote_code=True
             )
         except Exception as e:
             print(f"AutoPipeline failed: {e}. Trying DiffusionPipeline...", flush=True)
             pipeline = DiffusionPipeline.from_pretrained(
                 MODEL_ID, torch_dtype=torch_dtype,
-                use_safetensors=True, local_files_only=True
+                use_safetensors=True, local_files_only=True,
+                trust_remote_code=True
             )
             
     #Params to reduce GPU/CPU usage 

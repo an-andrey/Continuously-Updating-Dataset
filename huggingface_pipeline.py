@@ -5,6 +5,8 @@ OUTPUT: Stores generated images in STAGING_DIR, saves seen models in REGISTRY_FI
 Scans through HF diffusion models, and if it fits, requests a certain amount of prompts ( see classify_model function ) through generate_batch_samples.py
 """
 
+import builtins
+builtins.print("Script started, beginning imports...")
 
 import os
 import json
@@ -14,10 +16,10 @@ import subprocess
 import shutil
 import time
 from dotenv import load_dotenv
-import builtins
 from datetime import datetime
 import sys
 import glob
+import argparse
 
 load_dotenv() 
 
@@ -26,6 +28,12 @@ from huggingface_hub import HfApi, model_info, snapshot_download
 REGISTRY_FILE = "model_registry.json"
 STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
 TODAY = datetime.now().strftime("%Y-%m-%d")
+
+# if a --model is passed, parse only that model
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", type=str, default=None, help="Process a single model by ID (e.g. PaddlePaddle/ernie-vilg)")
+args = parser.parse_args()
+
 
 def timestamped_print(*args, **kwargs):
     """Wraps the standard print function to prepend a timestamp."""
@@ -99,11 +107,16 @@ def run_hf_generator():
     
     # Load and sync registry
     registry = load_registry()
-    
-    print("Fetching txt2img models from Hugging Face...")
-    models = api.list_models(filter="diffusers", sort="downloads", full=True, limit=1000)
 
-    for model in models:
+    if args.model: # custom model input
+        print(f"Single-model mode: targeting {args.model}")
+        single = api.model_info(args.model)
+        models_to_process = [single]
+    else:
+        print("Fetching txt2img models from Hugging Face...")
+        models_to_process = api.list_models(filter="diffusers", sort="downloads", full=True, limit=1000)
+
+    for model in models_to_process:
         # Skip if already processed successfully or blacklisted
         if model.id in registry:
             status = registry[model.id].get("status")
@@ -112,7 +125,8 @@ def run_hf_generator():
             # If INFRASTRUCTURE_FAULT, we let it try again
 
         downloads = getattr(model, "downloads", 0)
-        if downloads < 30000:
+
+        if not args.model and downloads < 30000:
             continue
             
         if not check_safetensors_available(model.id):
@@ -128,7 +142,7 @@ def run_hf_generator():
             continue
 
 
-        is_video_model = "video" in pipeline_task.lower()
+        is_video_model = False #"video" in pipeline_task.lower() # video models not functional at the moment
         model_type, target_count, base_model_id = classify_model(model)
         safe_model_name = model.id.replace("/", "_")
         release_date = model.created_at.strftime("%Y-%m-%d") if getattr(model, "created_at", None) else "unknown"

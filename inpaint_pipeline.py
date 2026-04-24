@@ -1,24 +1,26 @@
 """
 Inpainting HuggingFace pipeline code. Start it with `./start_inpaint_pipeline.sh`
-OUTPUT: Stores inpainted images in STAGING_DIR, saves seen models in REGISTRY_FILE
 
-Scans through HF diffusion models that support inpainting. For each compatible model:
+Usage:
+    python -u inpaint_pipeline.py                              # scan all diffusers models
+    python -u inpaint_pipeline.py --model black-forest-labs/FLUX.1-dev  # run specific model(s)
+    python -u inpaint_pipeline.py --model model/A model/B      # run multiple specific models
+
+For each compatible inpainting model:
 1. Downloads model weights (login node, online)
-2. Sanity-checks the model loads as an inpainting pipeline on CPU
-3. Downloads the required images + masks from AWS (parallel, login node)
-4. Submits a SLURM array job to the offline compute nodes for generation
-5. Cleans up images + masks to free file quota
+2. Downloads only the required IMAGES from S3 (masks are already on disk)
+3. Submits a SLURM array job to the offline compute nodes for generation
+4. Cleans up temp images to free file quota (masks stay permanently)
 """
 
 import os
 import json
-import torch
 import pandas as pd
 import subprocess
 import shutil
 import time
-import gc
 import sys
+import argparse
 import concurrent.futures
 from dotenv import load_dotenv
 import builtins
@@ -26,22 +28,21 @@ from datetime import datetime
 
 load_dotenv()
 
-from huggingface_hub import HfApi, model_info, snapshot_download
-from diffusers import AutoPipelineForInpainting
+from huggingface_hub import HfApi, model_info as get_model_info, snapshot_download
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 REGISTRY_FILE = "inpaint_model_registry.json"
-STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
-MASTER_PROMPTS_CSV = "/home/aandrey/links/scratch/data/open_images/master_prompts_200k.csv"
+STAGING_DIR = "/home/aandrey/links/scratch/data/staging_inpaint_images"
+MASTER_PROMPTS_CSV = "/home/aandrey/links/scratch/data/open_images/master_prompts_300k.csv"
+MASKS_DIR = "/home/aandrey/links/scratch/data/open_images/masks"
 INPAINT_TMP_ROOT = "/home/aandrey/links/scratch/data/inpaint_tmp"
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
-# How many image+mask pairs to pre-download per model run (always download the max)
-MAX_PREFETCH = 10000
+IMAGE_BASE_URL = "https://s3.amazonaws.com/open-images-dataset/train"
 
-# Parallel download threads (I/O-bound, so high count is fine)
+# Parallel download threads for images (I/O-bound)
 DOWNLOAD_WORKERS = 32
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ def timestamped_print(*args, **kwargs):
 print = timestamped_print
 
 # ---------------------------------------------------------------------------
-# Registry helpers (same pattern as txt2img pipeline)
+# Registry helpers
 # ---------------------------------------------------------------------------
 def load_registry():
     if os.path.exists(REGISTRY_FILE):
@@ -72,7 +73,7 @@ def save_registry(registry):
 def check_safetensors_available(model_id):
     print("Verifying safetensors...")
     try:
-        info = model_info(model_id)
+        info = get_model_info(model_id)
         print(f"Scanning through {len(info.siblings)} items")
         file_names = [f.rfilename for f in info.siblings]
         return any(fname.endswith(".safetensors") for fname in file_names)
@@ -113,136 +114,143 @@ def classify_model(model):
     return "Base", 10000, "None"
 
 # ---------------------------------------------------------------------------
-# CPU sanity check — catches incompatible architectures before image download
+# Image download (masks are permanently on disk at MASKS_DIR)
 # ---------------------------------------------------------------------------
-def sanity_check_inpainting(model_id, model_type, base_model_id):
-    """
-    Try to instantiate the inpainting pipeline on CPU.
-    Returns True if the model is compatible, False otherwise.
-    """
-    print(f"Running CPU sanity check for {model_id}...")
-    try:
-        load_id = base_model_id if model_type == "LoRA" and base_model_id != "None" else model_id
-        pipe = AutoPipelineForInpainting.from_pretrained(
-            load_id,
-            torch_dtype=torch.float32,
-            local_files_only=True,
-        )
-        if model_type == "LoRA":
-            pipe.load_lora_weights(model_id, local_files_only=True)
-        del pipe
-        gc.collect()
-        print(f"Sanity check PASSED for {model_id}.")
-        return True
-    except Exception as e:
-        print(f"Sanity check FAILED for {model_id}: {e}")
-        return False
-
-# ---------------------------------------------------------------------------
-# Image + mask download from AWS
-# ---------------------------------------------------------------------------
-def load_master_prompts(count):
-    """Load the first `count` rows from the master prompts CSV."""
-    df = pd.read_csv(MASTER_PROMPTS_CSV, nrows=count)
+def load_master_prompts():
+    df = pd.read_csv(MASTER_PROMPTS_CSV)
     return df
 
 
-def download_single_file(url, dest_path):
-    """Download a single file from a URL using subprocess curl (robust on HPC)."""
-    try:
-        subprocess.run(
-            ["curl", "-sS", "-L", "-o", dest_path, url],
-            check=True, timeout=120
-        )
+def download_single_image(args):
+    image_id, dest_path = args
+    if os.path.exists(dest_path):
         return True
-    except Exception as e:
-        print(f"Failed to download {url}: {e}")
-        return False
+    url = f"{IMAGE_BASE_URL}/{image_id}.jpg"
+    result = subprocess.run(
+        ["curl", "-sS", "-L", "-f", "-o", dest_path, "--max-time", "30", url],
+        capture_output=True, text=True
+    )
+    return result.returncode == 0
 
 
-def download_images_and_masks(batch_df, temp_data_dir):
-    """
-    Download all images and masks for the batch in parallel.
-    Expects batch_df to have columns: image_url, mask_url, image_file, mask_file
-    Adjust column names to match your actual master_prompts CSV schema.
-    """
-    images_dir = os.path.join(temp_data_dir, "images")
-    masks_dir = os.path.join(temp_data_dir, "masks")
-    os.makedirs(images_dir, exist_ok=True)
-    os.makedirs(masks_dir, exist_ok=True)
+def download_images(batch_df, temp_images_dir):
+    """Download images from S3 in parallel. Masks are NOT downloaded."""
+    os.makedirs(temp_images_dir, exist_ok=True)
 
-    download_tasks = []
+    # Deduplicate by ImageID
+    unique_images = {}
     for _, row in batch_df.iterrows():
-        # Adjust these column names to match your CSV
-        img_url = row.get("image_url", "")
-        mask_url = row.get("mask_url", "")
-        img_filename = row.get("ImageID", "unknown") + ".jpg"
-        mask_filename = row.get("MaskPath", row.get("ImageID", "unknown")) + "_mask.png"
+        image_id = row["ImageID"]
+        if image_id not in unique_images:
+            unique_images[image_id] = os.path.join(temp_images_dir, f"{image_id}.jpg")
 
-        if img_url:
-            download_tasks.append((img_url, os.path.join(images_dir, img_filename)))
-        if mask_url:
-            download_tasks.append((mask_url, os.path.join(masks_dir, mask_filename)))
+    to_download = [(iid, path) for iid, path in unique_images.items() if not os.path.exists(path)]
+    already = len(unique_images) - len(to_download)
+    print(f"Downloading {len(to_download)} images ({already} already cached)...")
 
-    print(f"Downloading {len(download_tasks)} files with {DOWNLOAD_WORKERS} threads...")
+    if not to_download:
+        return 0
+
     failed = 0
+    done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
-        futures = {
-            pool.submit(download_single_file, url, dest): (url, dest)
-            for url, dest in download_tasks
-        }
+        futures = {pool.submit(download_single_image, item): item for item in to_download}
         for future in concurrent.futures.as_completed(futures):
+            done += 1
             if not future.result():
                 failed += 1
+            if done % 500 == 0:
+                print(f"  Downloaded {done}/{len(to_download)} images...", flush=True)
 
-    print(f"Download complete. {len(download_tasks) - failed} succeeded, {failed} failed.")
+    print(f"Download complete. {len(to_download) - failed} succeeded, {failed} failed.")
     return failed
+
+
+def get_valid_sample(master_df, target_count, masks_dir, model_id):
+    """
+    Shuffles the master dataframe with a model-specific seed and verifies masks lazily.
+    Each model gets a different random selection from the full 300k.
+    Stops as soon as it finds enough valid masks.
+    """
+    shuffled_df = master_df.sample(
+        frac=1, random_state=hash(model_id) % 2**31
+    ).reset_index(drop=True)
+
+    valid_rows = []
+    missing = 0
+
+    for _, row in shuffled_df.iterrows():
+        mask_path = os.path.join(masks_dir, row["MaskPath"])
+
+        if os.path.exists(mask_path):
+            valid_rows.append(row)
+            if len(valid_rows) == target_count:
+                break
+        else:
+            missing += 1
+
+    if missing > 0:
+        print(f"WARNING: Encountered {missing} missing masks during sampling.")
+
+    return pd.DataFrame(valid_rows)
 
 # ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
-def run_inpaint_pipeline():
+def run_inpaint_pipeline(specific_models=None):
     api = HfApi()
     registry = load_registry()
 
-    print("Fetching inpainting-capable models from Hugging Face...")
-    models = api.list_models(filter="diffusers", sort="downloads", full=True, limit=1000)
-
     # Load the master prompts CSV once
-    master_df = load_master_prompts(MAX_PREFETCH)
+    master_df = load_master_prompts()
     print(f"Loaded {len(master_df)} rows from master prompts CSV.")
 
+    if specific_models:
+        # Run specific models — fetch their info from HF
+        print(f"Running specific models: {specific_models}")
+        models = []
+        for mid in specific_models:
+            try:
+                info = get_model_info(mid)
+                models.append(info)
+                print(f"  Found: {mid}")
+            except Exception as e:
+                print(f"  Could not find {mid}: {e}")
+    else:
+        print("Fetching inpainting-capable models from Hugging Face...")
+        models = api.list_models(filter="diffusers", sort="downloads", full=True, limit=1000)
+
     for model in models:
-        # Skip already processed or blacklisted models
-        if model.id in registry:
-            status = registry[model.id].get("status")
-            if status in ["COMPLETED", "MODEL_FAULT"]:
+        # Skip filters when running specific models
+        if not specific_models:
+            if model.id in registry:
+                status = registry[model.id].get("status")
+                if status in ["COMPLETED", "MODEL_FAULT"]:
+                    continue
+
+            downloads = getattr(model, "downloads", 0)
+            if downloads < 30000:
                 continue
 
-        downloads = getattr(model, "downloads", 0)
-        if downloads < 30000:
-            continue
+            pipeline_task = getattr(model, "pipeline_tag", "") or ""
+            if any(bad in pipeline_task.lower() for bad in ["audio", "3d", "video"]):
+                print(f"Skipping {model.id}: incompatible task '{pipeline_task}'.")
+                registry[model.id] = {
+                    "status": "MODEL_FAULT",
+                    "reason": f"Incompatible task: {pipeline_task}",
+                    "date": TODAY,
+                }
+                save_registry(registry)
+                continue
 
-        # Filter out non-image models
-        pipeline_task = getattr(model, "pipeline_tag", "") or ""
-        if any(bad in pipeline_task.lower() for bad in ["audio", "3d", "video"]):
-            print(f"Skipping {model.id}: incompatible task '{pipeline_task}'.")
-            registry[model.id] = {
-                "status": "MODEL_FAULT",
-                "reason": f"Incompatible task: {pipeline_task}",
-                "date": TODAY,
-            }
-            save_registry(registry)
-            continue
-
-        if not check_safetensors_available(model.id):
-            registry[model.id] = {
-                "status": "MODEL_FAULT",
-                "reason": "No safetensors found",
-                "date": TODAY,
-            }
-            save_registry(registry)
-            continue
+            if not check_safetensors_available(model.id):
+                registry[model.id] = {
+                    "status": "MODEL_FAULT",
+                    "reason": "No safetensors found",
+                    "date": TODAY,
+                }
+                save_registry(registry)
+                continue
 
         model_type, target_count, base_model_id = classify_model(model)
         safe_model_name = model.id.replace("/", "_")
@@ -270,47 +278,59 @@ def run_inpaint_pipeline():
                 continue
 
             # ---------------------------------------------------------------
-            # Step 2: CPU sanity check — does this model work for inpainting?
+            # Step 2: Sample prompts, verify masks, download images
             # ---------------------------------------------------------------
-            if not sanity_check_inpainting(model.id, model_type, base_model_id):
+            temp_data_dir = os.path.join(INPAINT_TMP_ROOT, safe_model_name)
+            temp_images_dir = os.path.join(temp_data_dir, "images")
+
+            # Get exactly target_count valid rows with model-specific shuffle
+            sampled_df = get_valid_sample(master_df, target_count, MASKS_DIR, model.id)
+
+            if len(sampled_df) < target_count:
+                print(f"ERROR: Could only find {len(sampled_df)} valid masks, need {target_count}. "
+                      f"Skipping {model.id}. Run download_masks.py to fix.")
                 registry[model.id] = {
-                    "status": "MODEL_FAULT",
-                    "reason": "Failed inpainting sanity check on CPU",
+                    "status": "INFRASTRUCTURE_FAULT",
+                    "reason": f"Only {len(sampled_df)} masks available, need {target_count}",
                     "date": TODAY,
                 }
                 save_registry(registry)
                 continue
 
-            # ---------------------------------------------------------------
-            # Step 3: Download images + masks from AWS
-            # Always prefetch MAX_PREFETCH; the compute script will only use
-            # what it needs based on target_count.
-            # ---------------------------------------------------------------
-            temp_data_dir = os.path.join(INPAINT_TMP_ROOT, safe_model_name)
-            batch_df = master_df.head(MAX_PREFETCH)
-
-            print(f"Downloading images and masks to {temp_data_dir}...")
-            download_images_and_masks(batch_df, temp_data_dir)
-
-            # Save the metadata slice so the compute script knows what to process
-            batch_df.head(target_count).to_csv(
+            # Save manifest so compute script knows exactly which rows to use
+            os.makedirs(temp_data_dir, exist_ok=True)
+            sampled_df.to_csv(
                 os.path.join(temp_data_dir, "batch_manifest.csv"), index=False
             )
 
+            print(f"Downloading {len(sampled_df)} images to {temp_images_dir}...")
+            download_images(sampled_df, temp_images_dir)
+
             # ---------------------------------------------------------------
-            # Step 4: Submit SLURM job
+            # Step 3: Submit SLURM job with tiered resources
             # ---------------------------------------------------------------
             if target_count >= 10000:
-                array_tasks = 5
+                array_tasks = 10
             elif target_count >= 5000:
-                array_tasks = 2
+                array_tasks = 5
             else:
-                array_tasks = 1
+                array_tasks = 3
+
+            # Check if this is a retry (previous INFRASTRUCTURE_FAULT)
+            prev_status = registry.get(model.id, {})
+            is_retry = prev_status.get("status") == "INFRASTRUCTURE_FAULT"
+            was_oom = "Memory" in prev_status.get("reason", "")
+
+            if is_retry and was_oom:
+                sbatch_script = "submit_generate_inpaint_samples_large.sh"
+                print(f"RETRY (OOM) — using large resource allocation.")
+            else:
+                sbatch_script = "submit_generate_inpaint_samples.sh"
 
             log_dir = f"data/slurm_logs/{TODAY}"
             os.makedirs(log_dir, exist_ok=True)
 
-            print(f"Submitting inpaint array ({array_tasks} tasks)...")
+            print(f"Submitting inpaint array ({array_tasks} tasks) via {sbatch_script}...")
 
             process = subprocess.run(
                 [
@@ -318,7 +338,7 @@ def run_inpaint_pipeline():
                     "--wait",
                     f"--array=0-{array_tasks - 1}",
                     f"--output={log_dir}/gen_inpaint-{safe_model_name}-%A_%a.out",
-                    "submit_generate_inpaint_samples.sh",
+                    sbatch_script,
                     model.id,
                     str(target_count),
                     model_type,
@@ -376,14 +396,12 @@ def run_inpaint_pipeline():
             save_registry(registry)
 
             # ---------------------------------------------------------------
-            # Step 5: Cleanup
+            # Cleanup — delete temp images only (masks stay)
             # ---------------------------------------------------------------
-            # Always clean up downloaded images + masks to free file quota
             if os.path.exists(temp_data_dir):
                 print(f"Cleaning up temp images at {temp_data_dir}...")
                 shutil.rmtree(temp_data_dir)
 
-            # Clean model weights from HF cache if permanently done
             current_status = registry.get(model.id, {}).get("status")
             if current_status != "INFRASTRUCTURE_FAULT":
                 print(f"Cleaning up {model.id} from HF cache...")
@@ -407,11 +425,14 @@ def run_inpaint_pipeline():
             }
             save_registry(registry)
 
-            # Still clean up temp images on failure
             temp_data_dir = os.path.join(INPAINT_TMP_ROOT, safe_model_name)
             if os.path.exists(temp_data_dir):
                 shutil.rmtree(temp_data_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    run_inpaint_pipeline()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, nargs="+", default=None,
+                        help="Run specific model(s) only, e.g. --model black-forest-labs/FLUX.1-dev")
+    args = parser.parse_args()
+    run_inpaint_pipeline(specific_models=args.model)

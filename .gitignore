@@ -10,3 +10,4 @@ models
 *.
 logs/*
 slurm_logs/*
+samples

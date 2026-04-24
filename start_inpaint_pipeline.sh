@@ -21,4 +21,4 @@ echo " Slurm Logs: slurm_logs/$TODAY/"
 echo "========================================"
 
 # Launch tmux detached, running the python script with the 2>&1 pipe
-tmux new -s inpaint_pipeline "$LOAD_ENV && python -u inpaint_pipeline.py 2>&1 | tee -a $LOG_FILE"
+tmux new -s inpaint_pipeline "echo 'loading linux env...' && $LOAD_ENV && python -u inpaint_pipeline.py 2>&1 | tee -a $LOG_FILE"

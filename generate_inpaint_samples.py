@@ -11,6 +11,7 @@ Usage:
 
 import os
 import sys
+print(f"beginning imports...", flush=True)
 import csv
 import fcntl
 import torch
@@ -23,6 +24,7 @@ from PIL import Image
 from datetime import datetime
 from diffusers import AutoPipelineForInpainting
 from dotenv import load_dotenv
+print(f"imports done.", flush=True)
 
 load_dotenv()
 
@@ -34,11 +36,16 @@ BASE_MODEL_ID = sys.argv[4]
 TEMP_DATA_DIR = sys.argv[5]
 RELEASE_DATE = sys.argv[6]
 
-STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
+STAGING_DIR = "/home/aandrey/links/scratch/data/staging_inpaint_images"
 METADATA_CSV = os.path.join(STAGING_DIR, "metadata.csv")
-MANIFEST_CSV = os.path.join(TEMP_DATA_DIR, "batch_manifest.csv")
 
-METADATA_FIELDS = ["filename", "prompt", "label", "model", "type", "release_date"]
+IMAGE_BASE_URL = "https://s3.amazonaws.com/open-images-dataset/train"
+MASK_BASE_URL = "https://storage.googleapis.com/openimages/v5/train-masks/train-masks-"
+
+METADATA_FIELDS = [
+    "filename", "prompt", "label", "model", "type", "release_date",
+    "source_image_url", "mask_url", "mask_path", "class_name",
+]
 
 # Error codes (same as txt2img pipeline)
 EXIT_DATA_FAULT = 10
@@ -50,45 +57,58 @@ EXIT_CODE_BUG = 14
 task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
 task_count = int(os.environ.get("SLURM_ARRAY_TASK_COUNT", 1))
 
-images_per_task = TOTAL_AMT_IMAGES_TO_GENERATE // task_count
-start_index = task_id * images_per_task
-end_index = start_index + images_per_task
-
-if task_id == task_count - 1:
-    end_index = TOTAL_AMT_IMAGES_TO_GENERATE
-
-target_count_for_this_gpu = end_index - start_index
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-# Mask dilation size in pixels (elliptical kernel)
-MASK_DILATION_PX = 15
 
+import random
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def dilate_mask(mask_pil, pixels=MASK_DILATION_PX):
-    """Dilate a PIL mask image to give the inpainter breathing room."""
+def dilate_mask(mask_pil, image_size):
+    """
+    Dilate a mask with randomized parameters for variety:
+    - Dilation amount: random between 2-8% of image's shorter dimension
+    - Kernel shape: randomly ellipse, rectangle, or cross
+    - Optionally apply slight gaussian blur for soft edges
+    """
     mask_np = np.array(mask_pil)
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (pixels * 2 + 1, pixels * 2 + 1)
-    )
+    shorter_dim = min(image_size)
+
+    # Random dilation: 2-8% of shorter image dimension
+    dilation_px = random.randint(int(shorter_dim * 0.02), int(shorter_dim * 0.08))
+    dilation_px = max(3, dilation_px)  # minimum 3px
+
+    # Random kernel shape
+    kernel_type = random.choice([cv2.MORPH_ELLIPSE, cv2.MORPH_RECT, cv2.MORPH_CROSS])
+    kernel = cv2.getStructuringElement(kernel_type, (dilation_px * 2 + 1, dilation_px * 2 + 1))
+
     dilated = cv2.dilate(mask_np, kernel, iterations=1)
+
+    # 50% chance of slight blur for softer edges
+    if random.random() < 0.5:
+        blur_size = random.choice([3, 5, 7])
+        dilated = cv2.GaussianBlur(dilated, (blur_size, blur_size), 0)
+        # Re-threshold to keep it binary-ish (inpainting pipelines expect this)
+        _, dilated = cv2.threshold(dilated, 127, 255, cv2.THRESH_BINARY)
+
     return Image.fromarray(dilated)
+
+
+MASKS_DIR = "/home/aandrey/links/scratch/data/open_images/masks"
 
 
 def load_image_and_mask(row):
     """
-    Load an image and its corresponding mask from the temp data directory.
-    Adjust the filename logic to match your CSV column names and file naming.
+    Load image from temp dir (downloaded per model run) and mask from
+    permanent storage (pre-extracted from Open Images zips).
     """
     image_id = row["ImageID"]
+    mask_filename = row["MaskPath"]
+
     img_path = os.path.join(TEMP_DATA_DIR, "images", f"{image_id}.jpg")
-    # Adjust mask filename pattern to match what download_images_and_masks produces
-    mask_filename = row.get("MaskPath", image_id) + "_mask.png"
-    mask_path = os.path.join(TEMP_DATA_DIR, "masks", mask_filename)
+    mask_path = os.path.join(MASKS_DIR, mask_filename)
 
     image = Image.open(img_path).convert("RGB")
     mask = Image.open(mask_path).convert("L")
@@ -97,7 +117,7 @@ def load_image_and_mask(row):
     if mask.size != image.size:
         mask = mask.resize(image.size, Image.NEAREST)
 
-    mask = dilate_mask(mask)
+    mask = dilate_mask(mask, image.size)
 
     return image, mask
 
@@ -118,13 +138,21 @@ def append_metadata_row(row_dict):
 # Main
 # ---------------------------------------------------------------------------
 try:
-    # Load the manifest for this task's slice
-    manifest_df = pd.read_csv(MANIFEST_CSV)
-    task_df = manifest_df.iloc[start_index:end_index].reset_index(drop=True)
+    # Load the manifest — the pipeline already sampled and verified masks
+    MANIFEST_CSV = os.path.join(TEMP_DATA_DIR, "batch_manifest.csv")
+    model_df = pd.read_csv(MANIFEST_CSV)
+
+    images_per_task = len(model_df) // task_count
+    start_index = task_id * images_per_task
+    end_index = len(model_df) if task_id == task_count - 1 else start_index + images_per_task
+    target_count_for_this_gpu = end_index - start_index
+
+    task_df = model_df.iloc[start_index:end_index].reset_index(drop=True)
 
     print(
-        f"Task {task_id}: Processing rows {start_index}-{end_index} "
-        f"({target_count_for_this_gpu} images).",
+        f"Task {task_id}: Processing {target_count_for_this_gpu} images "
+        f"(rows {start_index}-{end_index} of {TOTAL_AMT_IMAGES_TO_GENERATE}). "
+        f"Shuffled from {len(full_df)} total prompts.",
         flush=True,
     )
 
@@ -209,6 +237,11 @@ try:
                 # Save image to staging directory
                 img.save(os.path.join(STAGING_DIR, filename))
 
+                row_data = batch_slice.iloc[j]
+                image_id = row_data["ImageID"]
+                mask_filename = row_data["MaskPath"]
+                mask_shard = mask_filename[0].lower()
+
                 # Append metadata row to shared CSV
                 append_metadata_row({
                     "filename": filename,
@@ -217,6 +250,10 @@ try:
                     "model": MODEL_ID,
                     "type": MODEL_TYPE,
                     "release_date": RELEASE_DATE,
+                    "source_image_url": f"{IMAGE_BASE_URL}/{image_id}.jpg",
+                    "mask_url": f"{MASK_BASE_URL}{mask_shard}/{mask_filename}",
+                    "mask_path": mask_filename,
+                    "class_name": row_data["ClassName"],
                 })
 
             images_generated += current_chunk_size
@@ -265,6 +302,7 @@ try:
 except Exception as e:
     error_msg = str(e)
     error_msg_lower = error_msg.lower()
+    print(f"Task {task_id} ERROR: {traceback.format_exc()}", flush=True)
 
     if "cuda out of memory" in error_msg_lower:
         sys.exit(EXIT_MEMORY_FAULT)

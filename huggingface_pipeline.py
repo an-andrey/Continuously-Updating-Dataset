@@ -29,6 +29,11 @@ REGISTRY_FILE = "model_registry.json"
 STAGING_DIR = "/home/aandrey/links/scratch/data/staging_images"
 TODAY = datetime.now().strftime("%Y-%m-%d")
 
+BASE_MODEL_SAMPLES_AMT = 10000
+FINE_TUNE_MODEL_SAMPLES_AMT = 5000
+LORA_MODEL_SAMPLES_AMT = 2000
+
+
 # if a --model is passed, parse only that model
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default=None, help="Process a single model by ID (e.g. PaddlePaddle/ernie-vilg)")
@@ -79,28 +84,25 @@ def classify_model(model):
     
     # Handle edge cases where authors improperly format the YAML as a list
     if isinstance(base_model, list) and len(base_model) > 0:
-        base_model = base_model[1] # Grab the first element ['base_mode', 'model_id']
+        base_model = base_model[0]
         
     # Fallback: Scrape tags if the dependency is injected directly by the Hub
     if not base_model:
         for tag in tags:
             if tag.startswith("base_model:"):
-                # Grab ONLY the second half of the split (the actual ID)
-                base_model = tag.split(":", 1) 
+                base_model = tag.split(":", 1)[1]
                 break
 
-    safe_base = base_model if base_model else "None"
-    
     # Classification based strictly on Hub metadata architecture
     if "lora" in tags or "peft" in tags or "adapter" in tags:
-        return "LoRA", 2000, safe_base[1]
+        return "LoRA", LORA_MODEL_SAMPLES_AMT, base_model if base_model else "None"
         
     # If the model explicitly declares a parent, it is a fine-tune
     if base_model:
-        return "Fine-tune", 5000, safe_base[1]
+        return "Fine-tune", FINE_TUNE_MODEL_SAMPLES_AMT, base_model
         
     # If it has no parent dependency, it is a root node (Base model)
-    return "Base", 10000, "None"
+    return "Base", BASE_MODEL_SAMPLES_AMT, "None"
 
 def run_hf_generator():
     api = HfApi()
@@ -121,6 +123,8 @@ def run_hf_generator():
         if model.id in registry:
             status = registry[model.id].get("status")
             if status in ["COMPLETED", "MODEL_FAULT"]:
+                if args.model:
+                    print(f"Skipping {model.id} — already marked as {status}. Remove from registry to reprocess.")
                 continue
             # If INFRASTRUCTURE_FAULT, we let it try again
 
@@ -160,9 +164,9 @@ def run_hf_generator():
                 save_registry(registry)
                 continue
             
-            if target_count >= 10000: array_tasks = 5  
-            elif target_count >= 5000: array_tasks = 2  
-            else: array_tasks = 1  
+            if target_count >= 10000: array_tasks = 10 
+            elif target_count >= 5000: array_tasks = 5  
+            else: array_tasks = 2
             
             print(f"Submitting Array ({array_tasks} tasks) to slurm_logs/{TODAY}/...")
             

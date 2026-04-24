@@ -1,7 +1,7 @@
 """
 Generates TOTAL_AMT_IMAGES_TO_GENERATE of MODEL_ID
 If it's a LoRA model, the BASE_MODEL_ID is used instead with the weights
-Images are stored in STAGING_DIR, metadata appended to a per-model CSV
+Images are stored in STAGING_DIR, metadata appended to unified metadata.csv
 
 Usage:
 Called automatically from hugging_face_pipeline.py --> submit_generate_batch_samples.sh but can be called directly as 
@@ -30,9 +30,9 @@ MODEL_TYPE = sys.argv[3]
 BASE_MODEL_ID = sys.argv[4]
 RELEASE_DATE = sys.argv[5]
 
-METADATA_FIELDS = ["filename", "prompt", "label", "model", "type", "release_date"]
+METADATA_FIELDS = ["filename", "prompt", "label", "model", "type", "release_date", "packaged"]
 safe_model_name = MODEL_ID.replace("/", "_")
-METADATA_CSV = os.path.join(STAGING_DIR, f"metadata_{safe_model_name}.csv")
+METADATA_CSV = os.path.join(STAGING_DIR, "metadata.csv")
 
 # Error codes
 EXIT_DATA_FAULT = 10
@@ -67,7 +67,7 @@ torch_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
 
 def append_metadata_rows(rows):
-    """Append metadata rows to the per-model CSV with file locking for array task safety."""
+    """Append metadata rows to the unified metadata CSV with file locking for array task safety."""
     file_exists = os.path.exists(METADATA_CSV) and os.path.getsize(METADATA_CSV) > 0
     with open(METADATA_CSV, "a", newline="") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
@@ -157,6 +157,7 @@ try:
                     "model": MODEL_ID,
                     "type": MODEL_TYPE,
                     "release_date": RELEASE_DATE,
+                    "packaged": False,
                 })
             
             # Write all metadata for this batch in one locked operation

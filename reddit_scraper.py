@@ -296,7 +296,7 @@ def run_reddit_scraper(days_ago=None):
         print(f"Consider removing these from the target list.", flush=True)
         print(f"{'='*60}", flush=True)
 
-    print("Filtering NSFW images...")
+    print("Submitted NSFW image filter request")
     process = subprocess.run(
         [
             "sbatch",
@@ -308,6 +308,9 @@ def run_reddit_scraper(days_ago=None):
         capture_output=True,
         text=True,
     )
+
+    print("job submitted. Filtering images...")
+    print("see slurm logs dir to see status")
 
     if process.returncode == 0:
         print(f"Filtering successful.")
